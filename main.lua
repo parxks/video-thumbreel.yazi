@@ -1,20 +1,40 @@
 --- @since 25.2.7
 local M = {}
 
--- default settings
+-- FIXED: Bypassing XDG_CACHE_HOME to strictly prevent saving inside your .config directory
+local home_dir = os.getenv("HOME") or "/tmp"
+local cache_base = home_dir .. "/.cache"
+
+-- Default settings matching your specific requirements
 local opts = {
-    frames = 40,          -- number of webp frames to extract
-    fps = 1,              -- frames per second used during extraction (fallback)
-    autoplay = true,      -- start animation on hover
-    frame_density = nil,  -- ratio for dynamic frame count (overrides frames if set)
-    ffmpeg_preset = "fast",
-    webp_quality = 80,
-    cache_ttl_days = 30,  -- auto-clean sequences older than this many days
-    playback_fps = 12,    -- framerate for the preview playback animation
-    cache_dir = os.getenv("HOME") .. "/yazi-video-thumbreel",
-    width = 640,
-    height = 360,
+    base_frames = 30,               -- Base count for videos < 30 mins
+    base_30_min_frames = 50,         -- Base count for 30+ min videos
+    base_60_min_frames = 100,        -- Base count for 60+ min videos
+    frames_per_minute = 0.5,         -- Added frames per minute of video length (rounds up)
+    playback_fps = 2,               -- Frame rate for preview animation
+    webp_quality = 50,              -- WebP compression quality
+    width = 720,                    -- Rendering frame width
+    height = 405,                   -- Rendering frame height
+    speed_preset = 3,               -- libwebp speed/compression preset (0-6)
+    autoplay = true,                -- Start animation on hover
+    loop = false,                   -- Keep animation looping
+    cache_ttl_days = 30,            -- Auto-clean stale caches
+    cache_dir = cache_base .. "/yazi-video-thumbreel",
 }
+
+-- Registry to track active playback states across the runtime
+M.play_states = M.play_states or {}
+M._is_initialized = false
+
+-- Self-initializing function to ensure folders exist even if setup() wasn't manually called
+local function ensure_init()
+    if M._is_initialized then return end
+    M._is_initialized = true
+    
+    os.execute(string.format('mkdir -p "%s"', opts.cache_dir))
+    M:check_and_invalidate_cache()
+    M:auto_clean()
+end
 
 function M:setup(user_opts)
     if user_opts then
@@ -22,13 +42,39 @@ function M:setup(user_opts)
             opts[k] = v
         end
     end
-    
-    os.execute('mkdir -p "' .. opts.cache_dir .. '"')
-    self:auto_clean()
+    ensure_init()
 end
 
+-- Invalidation Flag check. Triggers automatic cache flush when defaults or parameters change.
+function M:check_and_invalidate_cache()
+    local status_path = opts.cache_dir .. "/.defaults-status"
+    local current_sig = string.format(
+        "base=%d|base30=%d|base60=%d|fpm=%.2f|fps=%d|q=%d|w=%d|h=%d|speed=%d|autoplay=%s|loop=%s",
+        opts.base_frames, opts.base_30_min_frames, opts.base_60_min_frames,
+        opts.frames_per_minute, opts.playback_fps, opts.webp_quality,
+        opts.width, opts.height, opts.speed_preset,
+        tostring(opts.autoplay), tostring(opts.loop)
+    )
+    
+    local f = io.open(status_path, "r")
+    local old_sig = f and f:read("*a")
+    if f then f:close() end
+    
+    if old_sig ~= current_sig then
+        -- Purge everything in the cache directory when defaults change
+        os.execute(string.format('find "%s" -type f \\( -name "*.webp" -o -name "*.done" \\) -delete 2>/dev/null', opts.cache_dir))
+        
+        -- Store the updated configuration signature
+        local wf = io.open(status_path, "w")
+        if wf then
+            wf:write(current_sig)
+            wf:close()
+        end
+    end
+end
+
+-- Cleans stale extraction sequences based on elapsed time (cache_ttl_days)
 function M:auto_clean()
-    -- Smart Cache Auto-Clean: Deletes sequences whose .done file hasn't been modified in N days.
     local cmd = string.format([[
         find "%s" -name "*.done" -type f -mtime +%d -print0 2>/dev/null |
         while IFS= read -r -d '' file; do
@@ -50,16 +96,16 @@ local function is_video_file(url_str)
     return ext and video_extensions[ext:lower()] == true
 end
 
--- Safely verify that a frame file exists and is completely written
+-- Validate WebP files on disk to prevent rendering partially written files
 local function is_valid_file(path)
     local f = io.open(path, "rb")
     if not f then return false end
     local size = f:seek("end")
     f:close()
-    return size and size > 100 -- Standard WebP file headers are > 100 bytes
+    return size and size > 100
 end
 
--- Extracts duration, resolution, and codec using ffprobe
+-- Fetch codec details, resolution, and total video duration
 local function get_media_info(url_str)
     local cmd = Command("ffprobe")
         :arg("-v"):arg("error")
@@ -88,12 +134,12 @@ local function get_media_info(url_str)
     return { codec = codec, width = width, height = height, duration = duration }
 end
 
--- Deduplication: Hash of basename + media info. Moving the file won't trigger regen.
+-- Build highly specific cache key so renamed files safely use cached copies
 local function get_cache_key(job, info)
     local basename = job.file.name or tostring(job.file.url):match("([^/]+)$")
     local hash_input = string.format("%s|%s|%dx%d|%.2f|%s|%s|%s",
         basename, info.codec, info.width, info.height, info.duration,
-        opts.frames, opts.fps, opts.webp_quality
+        opts.base_frames, opts.frames_per_minute, opts.webp_quality
     )
     
     local hash = 0
@@ -104,41 +150,49 @@ local function get_cache_key(job, info)
 end
 
 function M:peek(job)
+    ensure_init() -- Guarantee folders are generated and evaluated
+    
     local url_str = tostring(job.file.url)
     if not is_video_file(url_str) then return end
 
     local info = get_media_info(url_str)
     if not info or info.duration == 0 then return end
 
-    -- Layout calculation
+    -- Layout split calculation
     local img_area = ui.Rect { x = job.area.x, y = job.area.y, w = job.area.w, h = math.max(1, job.area.h - 1) }
     local txt_area = ui.Rect { x = job.area.x, y = job.area.y + job.area.h - 1, w = job.area.w, h = 1 }
 
-    -- Dynamic frame count calculation
-    local target_frames = opts.frames
-    if opts.frame_density then
-        target_frames = math.max(1, math.floor(info.duration * opts.frame_density))
+    -- Dynamic frames-per-minute allocation calculation
+    local duration_mins = info.duration / 60
+    local base = opts.base_frames
+    if duration_mins >= 60 then
+        base = opts.base_60_min_frames
+    elseif duration_mins >= 30 then
+        base = opts.base_30_min_frames
     end
+    local extra = math.ceil(duration_mins * opts.frames_per_minute)
+    local target_frames = base + extra
 
     local cache_key = get_cache_key(job, info)
     local first_frame_path = string.format("%s/%s_frame_0001.webp", opts.cache_dir, cache_key)
     local done_path = string.format("%s/%s.done", opts.cache_dir, cache_key)
 
-    -- Show text below image (codec, resolution, duration)
-    local info_str = string.format(" %s | %dx%d | %.1fs ", info.codec:upper(), info.width, info.height, info.duration)
+    -- Display codec specifications cleanly at the bottom
+    local info_str = string.format(" %s | %dx%d | %.1fs | %d frames ", info.codec:upper(), info.width, info.height, info.duration, target_frames)
     ya.preview_widget(job, { ui.Text(info_str):area(txt_area) })
 
-    -- Touch .done file to keep it alive (cache auto-clean)
+    -- Maintain last accessed timestamp (refreshes the auto-clean TTL)
     local done_file = io.open(done_path, "r")
     if done_file then
         done_file:close()
-        os.execute(string.format('touch "%s"', done_path))
+        -- Use non-blocking Yazi Command instead of blocking os.execute
+        Command("touch"):arg(done_path):spawn()
     end
 
-    -- Generate first frame quickly if missing (extracts exactly 1 frame instantly)
+    -- Fast-extraction for the initial render frame
     if not is_valid_file(first_frame_path) then
         Command("ffmpeg")
-            :arg("-ss"):arg(tostring(math.min(2.0, info.duration * 0.1))) -- Skip initial black frames safely
+            :arg("-ss"):arg(tostring(math.min(2.0, info.duration * 0.1)))
             :arg("-i"):arg(url_str)
             :arg("-frames:v"):arg("1")
             :arg("-c:v"):arg("libwebp")
@@ -151,66 +205,87 @@ function M:peek(job)
 
     ya.image_show(Url(first_frame_path), img_area)
 
-    -- Background frame generation using select filter to span the entire video cleanly
+    -- Start spawning batch frames across the entire timeline asynchronously 
     if not io.open(done_path, "r") then
-        local interval_sec = info.duration / target_frames
+        local extract_fps = target_frames / info.duration
         local ffmpeg_cmd = string.format(
-            'ffmpeg -i "%s" -vf "select=\'isnan(prev_selected_t)+gte(t-prev_selected_t,%f)\',scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2" -vframes %d -c:v libwebp -preset %s -quality %d -y "%s/%s_frame_%%04d.webp" && touch "%s"',
+            'ffmpeg -i "%s" -vf "fps=%f,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2" -vframes %d -c:v libwebp -speed %d -quality %d -y "%s/%s_frame_%%04d.webp" && touch "%s"',
             url_str,
-            interval_sec,
+            extract_fps,
             opts.width,
             opts.height,
             opts.width,
             opts.height,
             target_frames,
-            opts.ffmpeg_preset,
+            opts.speed_preset,
             opts.webp_quality,
             opts.cache_dir,
             cache_key,
             done_path
         )
-        -- Spawn completely in the background so Yazi UI never hangs!
         Command("sh"):arg("-c"):arg(ffmpeg_cmd):spawn()
     end
 
-    -- Hook: Autoplay handling
-    if not opts.autoplay then return end
+    -- Initialize State logic based on user preferences
+    if M.play_states[url_str] == nil then
+        M.play_states[url_str] = opts.autoplay and "playing" or "stopped"
+    end
 
-    -- Playback Animation (Sequentially loads and displays only fully valid existing frames)
+    if M.play_states[url_str] ~= "playing" then return end
+
+    -- Active playback loop with Dynamic sequential pre-loading
     if target_frames > 1 then
         local current_idx = 1
         local interval = 1 / opts.playback_fps
         while true do
             ya.sleep(interval)
             
-            -- Assemble all fully written frames sequentially.
-            -- This dynamically grows as the background ffmpeg process completes!
+            if M.play_states[url_str] ~= "playing" then break end
+
             local existing_frames = {}
             for i = 1, target_frames do
                 local path = string.format("%s/%s_frame_%04d.webp", opts.cache_dir, cache_key, i)
                 if is_valid_file(path) then
                     table.insert(existing_frames, path)
                 else
-                    break -- Keep it sequential; don't skip frames to avoid dynamic jumps
+                    break
                 end
             end
-            
-            -- Only animate when we have at least 2 valid frames ready.
-            -- This completely prevents the single-frame flashing/jitter!
+
             if #existing_frames > 1 then
-                current_idx = (current_idx % #existing_frames) + 1
+                current_idx = current_idx + 1
+                if current_idx > #existing_frames then
+                    if not opts.loop then
+                        M.play_states[url_str] = "stopped"
+                        break
+                    else
+                        current_idx = 1
+                    end
+                end
                 ya.image_show(Url(existing_frames[current_idx]), img_area)
             end
         end
     end
 end
 
--- Utility entries
+-- Keybind hook entry point to safely toggle states from Yazi UI
 function M:entry(job)
     local args = job.args or {}
     local action = args[1]
     
-    if action == "prebatch" then
+    if action == "toggle_play" then
+        local h = cx.active.current.hovered
+        if h then
+            local url_str = tostring(h.url)
+            if M.play_states[url_str] == "playing" then
+                M.play_states[url_str] = "stopped"
+            else
+                M.play_states[url_str] = "playing"
+            end
+            ya.manager_emit("peek", { force = true })
+        end
+        
+    elseif action == "prebatch" then
         local script = string.format([[
             TARGET=$(find . -type d 2>/dev/null | fzf --prompt="Select folder to prebatch (Esc to cancel): ")
             if [ -n "$TARGET" ]; then
