@@ -51,7 +51,12 @@ end
 -- Load the official Yazi video plugin (provides list_meta)
 local video_plugin_ok, video = pcall(require, "video")
 if not video_plugin_ok then
-    ya.err("Could not load built-in video plugin; falling back to ffprobe.")
+    ya.notify({
+        title = "Video Thumbreel",
+        content = "Could not load built-in video plugin; will use direct ffprobe.",
+        level = "warn",
+        timeout = 3,
+    })
 end
 
 local function get_media_info(url_str)
@@ -201,6 +206,12 @@ function M:auto_clean()
         done
     ]], opts.cache_dir, opts.cache_ttl_days)
     Command("sh"):arg("-c"):arg(cmd):spawn()
+end
+
+-- ====================== Yazi Hook: Clear queue on directory change ======================
+-- Yazi automatically calls on_cd when the directory changes.
+function M:on_cd(job)
+    clear_task_queue()
 end
 
 -- ====================== Preview Entry ======================
@@ -401,19 +412,6 @@ function M:entry(job)
     end
 end
 
--- ====================== Hooks for queue management ======================
--- Clear the task queue whenever the user changes directory.
--- This prevents processing of videos from a folder you already left.
-function M:cd_event(job)
-    clear_task_queue()
-end
-
--- Register the hook in Yazi's initialization.
-ya.hook("cd", function(job)
-    M:cd_event(job)
-end)
-
--- ====================== Cleanup ======================
 function M:seek(job) end
 
 return M
